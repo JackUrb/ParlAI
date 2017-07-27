@@ -12,24 +12,22 @@ import time
 from datetime import datetime
 import random
 import string
-import webbrowser
 import json
-import requests
 from parlai.core.agents import create_agent_from_shared
-from parlai.mturk.core.setup_aws import setup_aws, calculate_mturk_cost, check_mturk_balance, create_hit_type, create_hit_with_hit_type, setup_aws_credentials, create_hit_config, get_mturk_client
+from parlai.mturk.core.server_utils import setup_server, create_hit_config
+from parlai.mturk.core.mturk_utils import calculate_mturk_cost, check_mturk_balance, create_hit_type, create_hit_with_hit_type, get_mturk_client, setup_aws_credentials
 import threading
-from parlai.mturk.core.data_model import Base, Message
-from parlai.mturk.core.data_model import get_new_messages as _get_new_messages
-from parlai.mturk.core.data_model import COMMAND_GET_NEW_MESSAGES, COMMAND_SEND_MESSAGE, COMMAND_SHOW_DONE_BUTTON, COMMAND_EXPIRE_HIT
+from parlai.mturk.core.data_model import COMMAND_SEND_MESSAGE, COMMAND_SHOW_DONE_BUTTON, COMMAND_EXPIRE_HIT 
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 from botocore.exceptions import ClientError
 import uuid
-try:
-    import sqlite3
-except ModuleNotFoundError:
-    raise SystemExit("Please install sqlite3 by running: pip install sqlite3")
+import sqlite3
+from socketIO_client import SocketIO
+import webbrowser
+import requests
+import queue
 
 ASSIGNMENT_NOT_DONE = 'NotDone'
 ASSIGNMENT_DONE = 'Submitted'
@@ -38,29 +36,24 @@ ASSIGNMENT_REJECTED = 'Rejected'
 
 TIMEOUT_MESSAGE = '[TIMEOUT]'
 
-polling_interval = 1 # in seconds
-local_db_lock = threading.Lock()
-debug = False
+debug = True
 
 class MTurkManager():
     def __init__(self, opt, mturk_agent_ids):
-        self.html_api_endpoint_url = None
-        self.json_api_endpoint_url = None
+        self.server_url = None
         self.task_group_id = None
-        self.db_last_message_id = 0
-        self.db_thread = None
-        self.db_thread_stop_event = None
+        self.db_last_message_timestamp = 0
+        self.socket_listen_thread = None
+        self.socketIO = None
         self.run_id = None
         self.mturk_agent_ids = mturk_agent_ids
         self.mturk_agent_hit_id_dict = {}
         self.task_files_to_copy = None
-        self.unsent_messages_lock = threading.Lock()
-        self.unsent_messages = []
         self.is_sandbox = opt['is_sandbox']
 
     def init_aws(self, opt, task_directory_path=None):
         print("\nYou are going to allow workers from Amazon Mechanical Turk to be an agent in ParlAI.\nDuring this process, Internet connection is required, and you should turn off your computer's auto-sleep feature.\n")
-        key_input = input("Please press Enter to continue... ")
+        #key_input = input("Please press Enter to continue... ")
         print("")
 
         setup_aws_credentials()
@@ -75,7 +68,7 @@ class MTurkManager():
         if not check_mturk_balance(balance_needed=total_cost, is_sandbox=opt['is_sandbox']):
             return
 
-        print('Setting up MTurk backend...')
+        print('Setting up MTurk server...')
         create_hit_config(task_description=opt['task_description'], num_hits=opt['num_hits'], num_assignments=opt['num_assignments'], mturk_agent_ids=self.mturk_agent_ids, is_sandbox=opt['is_sandbox'])
         if not self.task_files_to_copy:
             self.task_files_to_copy = []
@@ -84,152 +77,221 @@ class MTurkManager():
         self.task_files_to_copy.append(os.path.join(task_directory_path, 'html', 'cover_page.html'))
         for mturk_agent_id in self.mturk_agent_ids:
             self.task_files_to_copy.append(os.path.join(task_directory_path, 'html', mturk_agent_id+'_index.html'))
-        html_api_endpoint_url, json_api_endpoint_url = setup_aws(task_files_to_copy = self.task_files_to_copy)
-        self.html_api_endpoint_url = html_api_endpoint_url
-        self.json_api_endpoint_url = json_api_endpoint_url
+        self.server_url, db_host = setup_server(task_files_to_copy = self.task_files_to_copy)
         if debug:
-            print(self.json_api_endpoint_url)
-        print("MTurk setup done.\n")
+            print(self.server_url)
 
-        # Create an engine connected to the in-memory database
-        engine = create_engine('sqlite://',
-                                connect_args={'check_same_thread':False},
-                                poolclass=StaticPool)
-         
-        # Create all tables in the engine
-        Base.metadata.create_all(engine)
-        Base.metadata.bind = engine
+        print('RDS: Cleaning database...')
+        params = {
+            'db_host': db_host
+        }
+        response = requests.get(self.server_url+'/clean_database', params=params)
+        assert(response.status_code != '200')
 
-        session_maker = sessionmaker(bind=engine)
+        print('Local: Setting up SocketIO...')
+        self.setup_socket(mturk_server_url=self.server_url, port=443)
 
-        self.db_session = scoped_session(session_maker)
+        print("MTurk server setup done.\n")
 
     def start_new_run(self, opt):
-        if self.db_thread_stop_event:
-            self.db_thread_stop_event.set()
-
         self.run_id = str(int(time.time()))
         self.task_group_id = str(opt['task']) + '_' + str(self.run_id)
-
-        self.db_thread_stop_event = threading.Event()
-        self.db_thread = threading.Thread(target=self._sync_with_remote_db, args=())
-        self.db_thread.daemon = True
-        self.db_thread.start()
-
-    def _sync_with_remote_db(self):
-        try:
-            while not self.db_thread_stop_event.is_set():
+        
+    def _send_event_to_socket(self, event_name, event_data, response_handler=None):
+        event_sent = threading.Event()
+        def on_event_sent(*args):
+            if not event_sent.is_set():
+                event_sent.set()
+        emit_success = False
+        while not emit_success:
+            try:
+                self.socketIO.emit(event_name, event_data, on_event_sent)
+                emit_success = True
+            except Exception as e:
                 if debug:
-                    print("Syncing with remote db...")
-                self.get_new_messages_and_save_to_db()
-                time.sleep(polling_interval)
-        except Exception as exception:
-            self._on_db_thread_exception(exception)
+                    print(e)
+                emit_success = False
 
-    def _on_db_thread_exception(self, exception):
-        self.expire_all_unassigned_hits()
-        raise exception
+        def check_event_sent():
+            if event_sent.wait(timeout=1): # Timeout in seconds
+                if response_handler:
+                    response_handler()
+            else:
+                print(event_name + ' not acknowledged by server. Sending event again.')
+                self._send_event_to_socket(event_name, event_data, response_handler)
 
-    def get_new_messages_and_save_to_db(self):
-        params = {
-            'method_name': 'get_new_messages',
-            'task_group_id': self.task_group_id,
-            'last_message_id': self.db_last_message_id,
-            'receiver_agent_id': '[World]'
-        }
-        response = requests.get(self.json_api_endpoint_url, params=params)
-        try:
-            ret = json.loads(response.json())
-        except Exception as e:
-            print(response.content)
-            raise e
-        conversation_dict = ret['conversation_dict']
-        if ret['last_message_id']:
-            self.db_last_message_id = ret['last_message_id']
+        thread = threading.Thread(target=check_event_sent)
+        thread.daemon = True
+        thread.start()
 
-        # Go through conversation_dict and save data in local db
-        for conversation_id, new_messages in conversation_dict.items():
-            for new_message in new_messages:
-                with local_db_lock:
-                    if self.db_session.query(Message).filter(Message.id==new_message['message_id']).count() == 0:
-                        obs_act_dict = {k:new_message[k] for k in new_message if k not in ['message_id']}
-                        new_message_in_local_db = Message(
-                                                    id = new_message['message_id'],
-                                                    task_group_id = self.task_group_id,
-                                                    conversation_id = conversation_id,
-                                                    sender_agent_id = new_message['id'],
-                                                    receiver_agent_id = new_message['receiver_agent_id'],
-                                                    message_content = json.dumps(obs_act_dict)
-                                                )
-                        self.db_session.add(new_message_in_local_db)
-                        self.db_session.commit()
-    
-    # Only gets new messages from local db, which syncs with remote db every `polling_interval` seconds.
-    def get_new_messages(self, task_group_id, conversation_id, receiver_agent_id, after_message_id, excluded_sender_agent_id=None, included_sender_agent_id=None):
-        with local_db_lock:
-            return _get_new_messages(
-                db_session=self.db_session,
-                task_group_id=task_group_id,
-                conversation_id=conversation_id,
-                receiver_agent_id=receiver_agent_id,
-                after_message_id=after_message_id,
-                excluded_sender_agent_id=excluded_sender_agent_id,
-                included_sender_agent_id=included_sender_agent_id,
-                populate_meta_info=True
+    def setup_socket(self, mturk_server_url, port):
+        self.socketIO = SocketIO(mturk_server_url, port)
+
+        def on_socket_open(*args):
+            if debug:
+                print("on_socket_open: ", args)
+            self._send_event_to_socket(
+                'agent_alive', 
+                {
+                    'task_group_id': self.task_group_id,
+                    'conversation_id': None,
+                    'agent_id': '[World]',
+                    'assignment_id': None,
+                    'hit_id': None,
+                    'worker_id': None
+                }
             )
 
-    def send_new_message(self, task_group_id, conversation_id, sender_agent_id, receiver_agent_id, message_text=None, reward=None, episode_done=False):
-        post_data_dict = {
-            'method_name': 'send_new_message',
+        def on_disconnect(*args):
+            if debug:
+                print("Server disconnected: ", args)
+
+        def on_agent_alive(*args):
+            if debug:
+                print("on_agent_alive:", args)
+            agent_info = args[0]
+            task_group_id = agent_info['task_group_id']
+            conversation_id = agent_info['conversation_id']
+            agent_id = agent_info['agent_id']
+            assignment_id = agent_info['assignment_id']
+            hit_id = agent_info['hit_id']
+            worker_id = agent_info['worker_id']
+
+            self._send_event_to_socket(
+                'agent_alive_received', 
+                {
+                    'task_group_id': task_group_id,
+                    'conversation_id': conversation_id,
+                    'agent_id': '[World]'
+                }
+            )
+
+            if task_group_id != self.task_group_id:
+                return
+
+            MTurkAgent.set_hit_assignment_info(
+                task_group_id=task_group_id,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                assignment_id=assignment_id,
+                hit_id=hit_id,
+                worker_id=worker_id
+            )
+
+            MTurkAgent.notify_agent_alive(
+                task_group_id=task_group_id,
+                conversation_id=conversation_id,
+                agent_id=agent_id
+            )
+
+        def on_new_message(*args):
+            if debug:
+                print("on_new_message:", args)
+
+            message = args[0]
+
+            self._send_event_to_socket(
+                'new_message_received', 
+                {
+                    'task_group_id': message['task_group_id'],
+                    'conversation_id': message['conversation_id'],
+                    'agent_id': '[World]'
+                }
+            )
+
+            if message['task_group_id'] != self.task_group_id:
+                return
+
+            MTurkAgent.set_new_message(
+                task_group_id=message['task_group_id'],
+                conversation_id=message['conversation_id'],
+                agent_id=message['sender_agent_id'],
+                new_message=message
+            )
+
+            # MTurkAgent.notify_agent_new_message(
+            #     task_group_id=message['task_group_id'],
+            #     conversation_id=message['conversation_id'],
+            #     agent_id=message['sender_agent_id']
+            # )
+
+        self.socketIO.on('socket_open', on_socket_open)
+        self.socketIO.on('agent_alive', on_agent_alive)
+        self.socketIO.on('new_message', on_new_message)
+        self.socketIO.on('disconnect', on_disconnect)
+
+        self.socket_listen_thread = threading.Thread(target=self._socket_receive_events)
+        self.socket_listen_thread.daemon = True
+        self.socket_listen_thread.start()
+        
+    def _socket_receive_events(self):
+        self.socketIO.wait()
+
+    def send_command_to_agent(self, task_group_id, conversation_id, sender_agent_id, receiver_agent_id, command):
+        command_dict = {
             'task_group_id': task_group_id,
             'conversation_id': conversation_id,
             'sender_agent_id': sender_agent_id,
             'receiver_agent_id': receiver_agent_id,
+            'command': command,
+            'command_id': str(uuid.uuid4()),
+        }
+
+        def on_agent_send_command_response(*args):
+            if debug:
+                print("on_agent_send_command_response:", args)
+
+        self._send_event_to_socket(
+            'agent_send_command',
+            command_dict,
+            on_agent_send_command_response
+        )
+        self.socketIO.wait_for_callbacks(seconds=0.1)
+
+    def send_message_to_agent(self, task_group_id, conversation_id, sender_agent_id, receiver_agent_id, message):
+        message['task_group_id'] = task_group_id
+        message['conversation_id'] = conversation_id
+        message['sender_agent_id'] = sender_agent_id
+        message['receiver_agent_id'] = receiver_agent_id
+        message['message_id'] = str(uuid.uuid4())
+
+        def on_agent_send_message_response(*args):
+            if debug:
+                print("on_agent_send_message_response:", args)
+
+        self._send_event_to_socket(
+            'agent_send_message',
+            message,
+            on_agent_send_message_response
+        )
+        self.socketIO.wait_for_callbacks(seconds=0.1)
+
+    def send_new_message(self, task_group_id, conversation_id, sender_agent_id, receiver_agent_id, message_text=None, reward=None, episode_done=False):
+        message = {
+            'id': sender_agent_id,
             'episode_done': episode_done,
         }
         if message_text:
-            post_data_dict['text'] = message_text
+            message['text'] = message_text
         if reward:
-            post_data_dict['reward'] = reward
+            message['reward'] = reward
 
-        response = requests.post(self.json_api_endpoint_url, data=json.dumps(post_data_dict))
-        try:
-            ret = json.loads(response.json())
-            return ret
-        except Exception as e:
-            print(response.content)
-            raise e
+        self.send_message_to_agent(
+            task_group_id=task_group_id,
+            conversation_id=conversation_id,
+            sender_agent_id=sender_agent_id,
+            receiver_agent_id=receiver_agent_id,
+            message=message
+        )
 
-    def send_new_command(self, task_group_id, conversation_id, receiver_agent_id, command):
-        post_data_dict = {
-            'method_name': 'send_new_command',
-            'task_group_id': task_group_id,
-            'conversation_id': conversation_id,
-            'receiver_agent_id': receiver_agent_id,
-            'command': command,
-        }
-        response = requests.post(self.json_api_endpoint_url, data=json.dumps(post_data_dict))
-        try:
-            ret = json.loads(response.json())
-            return ret
-        except Exception as e:
-            print(response.content)
-            raise e
-
-    def get_hit_assignment_info(self, task_group_id, conversation_id, agent_id):
-        params = {
-            'method_name': 'get_hit_assignment_info',
-            'task_group_id': task_group_id,
-            'agent_id': agent_id,
-            'conversation_id': conversation_id
-        }
-        response = requests.get(self.json_api_endpoint_url, params=params)
-        try:
-            ret = json.loads(response.json())
-            return ret['assignment_id'], ret['hit_id'], ret['worker_id']
-        except Exception as e:
-            print(response.content)
-            raise e
+    def send_new_command(self, task_group_id, conversation_id, sender_agent_id, receiver_agent_id, command):
+        self.send_command_to_agent(
+            task_group_id=task_group_id,
+            conversation_id=conversation_id,
+            sender_agent_id=sender_agent_id,
+            receiver_agent_id=receiver_agent_id,
+            command=command
+        )
 
     def get_agent_work_status(self, assignment_id):
         client = get_mturk_client(self.is_sandbox)
@@ -251,7 +313,10 @@ class MTurkManager():
             assignment_duration_in_seconds=opt.get('assignment_duration_in_seconds', 30 * 60), # Set to 30 minutes by default
             is_sandbox=opt['is_sandbox']
         )
-        mturk_chat_url = self.html_api_endpoint_url + "?method_name=chat_index&task_group_id="+str(self.task_group_id)
+        mturk_chat_url = self.server_url + "/chat_index?task_group_id="+str(self.task_group_id)
+        # TODO: create short link for this URL
+        print(mturk_chat_url)
+        #mturk_chat_url = input("Please enter short link:")
         mturk_page_url = None
         for mturk_agent_id in self.mturk_agent_ids:
             self.mturk_agent_hit_id_dict[mturk_agent_id] = {}
@@ -265,6 +330,7 @@ class MTurkManager():
                 self.mturk_agent_hit_id_dict[mturk_agent_id][hit_index] = hit_id
         print("Link to HIT: " + mturk_page_url + "\n")
         print("Waiting for Turkers to respond... (Please don't close your laptop or put your computer into sleep or standby mode.)\n")
+        webbrowser.open(mturk_page_url)
         return mturk_page_url
 
     def expire_hit(self, hit_id):
@@ -301,7 +367,7 @@ class MTurkManager():
         client = get_mturk_client(self.is_sandbox)
         client.send_bonus(
             WorkerId=worker_id,
-            BonusAmount=str(bonus_amount),
+            BonusAmount=bonus_amount,
             AssignmentId=assignment_id,
             Reason=reason,
             UniqueRequestToken=unique_request_token # Could be useful in the future, for handling network errors
@@ -322,28 +388,98 @@ class MTurkManager():
             return {'success': True}
 
     def shutdown(self):
-        setup_aws_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'setup_aws.py')
-        print("Remote database instance will accumulate cost over time (about $30/month for t2.medium instance). Please run `python "+setup_aws_file_path+" remove_rds` to remove RDS instance if you don't plan to use MTurk often.")
-        self.db_thread_stop_event.set()
+        setup_aws_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'server_utils.py')
+        print("Remote database instance will accumulate cost over time (about $8/month for t2.micro instance). Please run `python "+setup_aws_file_path+" remove_rds` to remove RDS instance if you don't plan to use MTurk often.")
 
 
 class MTurkAgent(Agent):
+    agent_global_id_to_instance = {}
+    
+    @classmethod
+    def get_agent_global_id(cls, task_group_id, conversation_id, agent_id):
+        # Global ID within the local system
+        return task_group_id + '_' + conversation_id + '_' + agent_id
+
+    # @classmethod
+    # def notify_agent_new_message(cls, task_group_id, conversation_id, agent_id):
+    #     agent_global_id = cls.get_agent_global_id(
+    #                             task_group_id=task_group_id,
+    #                             conversation_id=conversation_id,
+    #                             agent_id=agent_id
+    #                         )
+    #     if agent_global_id in cls.agent_global_id_to_instance:
+    #         cls.agent_global_id_to_instance[agent_global_id].notify_new_message()
+
+    @classmethod
+    def notify_agent_alive(cls, task_group_id, conversation_id, agent_id):
+        agent_global_id = cls.get_agent_global_id(
+                                task_group_id=task_group_id,
+                                conversation_id=conversation_id,
+                                agent_id=agent_id
+                            )
+        if agent_global_id in cls.agent_global_id_to_instance:
+            cls.agent_global_id_to_instance[agent_global_id].notify_alive()
+
+    @classmethod
+    def set_hit_assignment_info(cls, task_group_id, conversation_id, agent_id, assignment_id, hit_id, worker_id):
+        agent_global_id = cls.get_agent_global_id(
+                                task_group_id=task_group_id,
+                                conversation_id=conversation_id,
+                                agent_id=agent_id
+                            )
+        if agent_global_id in cls.agent_global_id_to_instance:
+            agent = cls.agent_global_id_to_instance[agent_global_id]
+            agent.assignment_id = assignment_id
+            agent.hit_id = hit_id
+            agent.worker_id = worker_id
+
+    @classmethod
+    def set_new_message(cls, task_group_id, conversation_id, agent_id, new_message):
+        agent_global_id = cls.get_agent_global_id(
+                                task_group_id=task_group_id,
+                                conversation_id=conversation_id,
+                                agent_id=agent_id
+                            )
+        if agent_global_id in cls.agent_global_id_to_instance:
+            agent = cls.agent_global_id_to_instance[agent_global_id]
+            with agent.new_message_lock:
+                agent.new_message = new_message
+
     def __init__(self, id, manager, hit_index, assignment_index, opt, shared=None):
         super().__init__(opt)
 
         self.conversation_id = str(hit_index) + '_' + str(assignment_index)
         self.manager = manager
         self.id = id
-        self.last_message_id = 0
+        self.last_message_timestamp = 0
         self.assignment_id = None
         self.hit_id = None
         self.worker_id = None
         self.hit_is_abandoned = False
+        self.agent_global_id = MTurkAgent.get_agent_global_id(
+                                    task_group_id=self.manager.task_group_id,
+                                    conversation_id=self.conversation_id,
+                                    agent_id=id
+                                )
+        MTurkAgent.agent_global_id_to_instance[self.agent_global_id] = self
+
+        self.alive_event = threading.Event()
+        self.new_message = None
+        self.new_message_lock = threading.Lock()
 
         # Wait for Turker to accept the HIT
-        while not (self.assignment_id and self.hit_id and self.worker_id):
-            self.assignment_id, self.hit_id, self.worker_id = self.manager.get_hit_assignment_info(self.manager.task_group_id, self.conversation_id, self.id)
-            time.sleep(polling_interval)
+        if self.alive_event.is_set():
+            self.alive_event.clear()
+        self.alive_event.wait()
+        print(self.assignment_id, self.hit_id, self.worker_id)
+
+    def notify_alive(self):
+        if not self.alive_event.is_set():
+            self.alive_event.set()
+
+    # def notify_new_message(self):
+    #     with self.new_message_condition:
+    #         self.new_message_condition.notify()
 
     def observe(self, msg):
         self.manager.send_new_message(
@@ -355,53 +491,37 @@ class MTurkAgent(Agent):
             reward=msg.get('reward', None),
             episode_done=msg.get('episode_done', False),
         )
-        self.manager.send_new_command(
-            task_group_id=self.manager.task_group_id,
-            conversation_id=self.conversation_id,
-            receiver_agent_id=self.id,
-            command=COMMAND_GET_NEW_MESSAGES
-        )
 
     def act(self, timeout=None): # Timeout in seconds, after which the HIT will be expired automatically
-        if timeout:
-            start_time = time.time()
-
         self.manager.send_new_command(
             task_group_id=self.manager.task_group_id,
             conversation_id=self.conversation_id,
+            sender_agent_id='[World]',
             receiver_agent_id=self.id,
             command=COMMAND_SEND_MESSAGE
         )
 
-        while True:
+        if timeout:
+            start_time = time.time()
+
+        # Wait for agent's new message
+        while not self.new_message:
             if timeout:
                 current_time = time.time()
                 if (current_time - start_time) > timeout:
-                    self.set_hit_is_abandoned()
+                    self.hit_is_abandoned = True
                     msg = {
                         'id': self.id,
                         'text': TIMEOUT_MESSAGE,
                         'episode_done': True
                     }
                     return msg
+            time.sleep(0.1)
 
-            conversation_dict, new_last_message_id = self.manager.get_new_messages(
-                task_group_id=self.manager.task_group_id,
-                conversation_id=self.conversation_id,
-                receiver_agent_id='[World]',
-                after_message_id=self.last_message_id,
-                included_sender_agent_id=self.id
-            )
-
-            if self.conversation_id in conversation_dict:
-                if new_last_message_id:
-                    self.last_message_id = new_last_message_id
-
-                new_messages = conversation_dict[self.conversation_id]
-
-                return new_messages[0]
-
-            time.sleep(polling_interval)
+        with self.new_message_lock:
+            new_message = self.new_message
+            self.new_message = None
+            return new_message
 
     def episode_done(self):
         return False
@@ -456,6 +576,7 @@ class MTurkAgent(Agent):
             self.manager.send_new_command(
                 task_group_id=self.manager.task_group_id,
                 conversation_id=self.conversation_id,
+                sender_agent_id='[World]',
                 receiver_agent_id=self.id,
                 command=COMMAND_EXPIRE_HIT
             )
@@ -472,7 +593,7 @@ class MTurkAgent(Agent):
                     return False
             if debug:
                 print("Waiting for Turker to complete the HIT...")
-            time.sleep(polling_interval)
+            time.sleep(1)
         print('Conversation ID: ' + str(self.conversation_id) + ', Agent ID: ' + self.id + ' - HIT is done.')
         return True
 
@@ -481,6 +602,7 @@ class MTurkAgent(Agent):
             self.manager.send_new_command(
                 task_group_id=self.manager.task_group_id,
                 conversation_id=self.conversation_id,
+                sender_agent_id='[World]',
                 receiver_agent_id=self.id,
                 command=COMMAND_SHOW_DONE_BUTTON
             )

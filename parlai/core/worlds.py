@@ -300,6 +300,7 @@ class MultiAgentDialogWorld(World):
         acts = self.acts
         for index, agent in enumerate(self.agents):
             acts[index] = agent.act()
+            print(acts[index])
             for other_agent in self.agents:
                 if other_agent != agent:
                     other_agent.observe(validate(acts[index]))
