@@ -348,7 +348,7 @@ def check_mturk_balance(balance_needed, is_sandbox):
     balance_needed = balance_needed * 1.2 # AWS charges 20% fee for both reward and bonus payment
 
     if user_balance < balance_needed:
-        print("You might not have enough money in your MTurk account. Please go to https://requester.mturk.com/account and increase your balance to at least balance, and then try again.")
+        print("You might not have enough money in your MTurk account. Please go to https://requester.mturk.com/account and increase your balance to at least " + balance_needed +", and then try again.")
         return False
     else:
         return True
