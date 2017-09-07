@@ -56,9 +56,6 @@ app.get('/chat_index', async function (req, res) {
     else {
       // Set up template params
       template_context['is_cover_page'] = false;
-      // TODO move this 650 to be in one location and one location only, it's
-      // a magic number in multiple places
-      template_context['frame_height'] = 650;
       template_context['cur_agent_id'] = mturk_agent_id;
       template_context['conversation_id'] = conversation_id;
 
